@@ -217,7 +217,7 @@ app.post('/playlists/prepare', async (req, res) => {
     client_id: SPOTIFY_CLIENT_ID,
     response_type: 'code',
     redirect_uri: REDIRECT_URI,
-    scope: 'playlist-read-private playlist-read-collaborative',
+    scope: 'playlist-read-private playlist-read-collaborative user-read-private',
     state,
     show_dialog: 'false', // don't show dialog if already authorized
   });
