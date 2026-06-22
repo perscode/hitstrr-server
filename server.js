@@ -70,6 +70,7 @@ async function getAppToken() {
 // ── User OAuth token exchange ─────────────────────────────────────────────────
 async function getUserToken(code) {
   const creds = Buffer.from(`${SPOTIFY_CLIENT_ID}:${SPOTIFY_CLIENT_SECRET}`).toString('base64');
+  console.log('Token exchange: redirect_uri =', REDIRECT_URI);
   const res = await fetch('https://accounts.spotify.com/api/token', {
     method: 'POST',
     headers: { 'Authorization': `Basic ${creds}`, 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -79,12 +80,14 @@ async function getUserToken(code) {
       redirect_uri: REDIRECT_URI,
     }).toString(),
   });
+  const responseText = await res.text();
+  console.log('Token exchange response:', res.status, responseText.substring(0, 200));
   if (!res.ok) {
-    const err = await res.text();
-    throw new Error(`Token exchange failed: ${res.status} ${err}`);
+    throw new Error(`Token exchange failed: ${res.status} ${responseText}`);
   }
-  const data = await res.json();
-  return data.access_token; // We only need this once, don't store it
+  const data = JSON.parse(responseText);
+  console.log('Got user token, scope:', data.scope);
+  return data.access_token;
 }
 
 // ── Year detection ────────────────────────────────────────────────────────────
@@ -127,11 +130,14 @@ function extractPlaylistId(input) {
 
 // ── Fetch playlist tracks with a given token ──────────────────────────────────
 async function fetchPlaylistWithToken(playlistId, token) {
+  console.log('Fetching playlist', playlistId, 'token starts with:', token.substring(0,10));
   const metaRes = await fetch(
     `https://api.spotify.com/v1/playlists/${playlistId}?fields=name,description`,
     { headers: { 'Authorization': `Bearer ${token}` } }
   );
-  if (!metaRes.ok) throw new Error(`Playlist not found or not accessible (${metaRes.status})`);
+  const metaText = await metaRes.text();
+  console.log('Playlist meta response:', metaRes.status, metaText.substring(0, 200));
+  if (!metaRes.ok) throw new Error(`Playlist not found or not accessible (${metaRes.status}): ${metaText}`);
   const meta = await metaRes.json();
 
   const tracks = [];
