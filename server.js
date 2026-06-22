@@ -3,19 +3,15 @@ const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
 
-
 const app = express();
 const PORT = process.env.PORT || 3000;
 const DATA_FILE = path.join(__dirname, 'playlists.json');
 
 const SPOTIFY_CLIENT_ID = process.env.SPOTIFY_CLIENT_ID;
 const SPOTIFY_CLIENT_SECRET = process.env.SPOTIFY_CLIENT_SECRET;
-const REDIRECT_URI = process.env.REDIRECT_URI || 'https://hitstrr-server-production.up.railway.app/callback';
-// Where to send the user after auth — the game's URL
-const GAME_URL = process.env.GAME_URL || 'https://flanders-pixel.github.io/hitstrr/';
 
 if (!SPOTIFY_CLIENT_ID || !SPOTIFY_CLIENT_SECRET) {
-  console.warn('WARNING: SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET not set.');
+  console.warn('WARNING: SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET not set. URL-based playlist fetching will not work.');
 }
 
 app.use(cors({
@@ -23,8 +19,8 @@ app.use(cors({
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
 }));
-app.options('*', cors()); // handle preflight
-app.use(express.json());
+app.options('*', cors());
+app.use(express.json({ limit: '5mb' })); // CSV files can be large
 
 // ── Storage ───────────────────────────────────────────────────────────────────
 function loadPlaylists() {
@@ -36,19 +32,7 @@ function savePlaylists(playlists) {
   fs.writeFileSync(DATA_FILE, JSON.stringify(playlists, null, 2));
 }
 
-// ── Pending playlist adds (in-memory, keyed by state param) ──────────────────
-// state -> { playlistUrl, emoji, timestamp }
-const pendingAdds = new Map();
-
-// Clean up old pending adds every 10 minutes
-setInterval(() => {
-  const cutoff = Date.now() - 10 * 60 * 1000;
-  for (const [k, v] of pendingAdds) {
-    if (v.timestamp < cutoff) pendingAdds.delete(k);
-  }
-}, 10 * 60 * 1000);
-
-// ── App-level Spotify token (for non-restricted playlists) ────────────────────
+// ── Spotify app-token (for unrestricted public playlists) ─────────────────────
 let appToken = null;
 let appTokenExpiry = 0;
 
@@ -65,29 +49,6 @@ async function getAppToken() {
   appToken = data.access_token;
   appTokenExpiry = Date.now() + (data.expires_in - 60) * 1000;
   return appToken;
-}
-
-// ── User OAuth token exchange ─────────────────────────────────────────────────
-async function getUserToken(code) {
-  const creds = Buffer.from(`${SPOTIFY_CLIENT_ID}:${SPOTIFY_CLIENT_SECRET}`).toString('base64');
-  console.log('Token exchange: redirect_uri =', REDIRECT_URI);
-  const res = await fetch('https://accounts.spotify.com/api/token', {
-    method: 'POST',
-    headers: { 'Authorization': `Basic ${creds}`, 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({
-      grant_type: 'authorization_code',
-      code,
-      redirect_uri: REDIRECT_URI,
-    }).toString(),
-  });
-  const responseText = await res.text();
-  console.log('Token exchange response:', res.status, responseText.substring(0, 200));
-  if (!res.ok) {
-    throw new Error(`Token exchange failed: ${res.status} ${responseText}`);
-  }
-  const data = JSON.parse(responseText);
-  console.log('Got user token, scope:', data.scope);
-  return data.access_token;
 }
 
 // ── Year detection ────────────────────────────────────────────────────────────
@@ -112,15 +73,13 @@ const TITLE_SUFFIXES = [
 ];
 function isLikelyRemaster(albumName) {
   if (!albumName) return false;
-  const lower = albumName.toLowerCase();
-  return REMASTER_KEYWORDS.some(kw => lower.includes(kw));
+  return REMASTER_KEYWORDS.some(kw => albumName.toLowerCase().includes(kw));
 }
 function cleanTitle(title) {
   let t = title;
   for (const re of TITLE_SUFFIXES) t = t.replace(re, '');
   return t.trim();
 }
-
 function extractPlaylistId(input) {
   const urlMatch = input.match(/playlist\/([a-zA-Z0-9]+)/);
   if (urlMatch) return urlMatch[1];
@@ -128,45 +87,25 @@ function extractPlaylistId(input) {
   return null;
 }
 
-// ── Fetch playlist tracks with a given token ──────────────────────────────────
-async function fetchPlaylistWithToken(playlistId, token) {
-  console.log('Fetching playlist', playlistId, 'token starts with:', token.substring(0,10));
-  const metaRes = await fetch(
-    `https://api.spotify.com/v1/playlists/${playlistId}?fields=name,description`,
-    { headers: { 'Authorization': `Bearer ${token}` } }
-  );
-  const metaText = await metaRes.text();
-  console.log('Playlist meta response:', metaRes.status, metaText.substring(0, 200));
-  if (!metaRes.ok) throw new Error(`Playlist not found or not accessible (${metaRes.status}): ${metaText}`);
-  const meta = JSON.parse(metaText);
-
-  const tracks = [];
-  let url = `https://api.spotify.com/v1/playlists/${playlistId}/tracks?limit=100&market=SE&additional_types=track`;
-  while (url) {
-    console.log('Fetching tracks page:', url.substring(0,80));
-    const res = await fetch(url, { headers: { 'Authorization': `Bearer ${token}` } });
-    const resText = await res.text();
-    console.log('Tracks response:', res.status, resText.substring(0,150));
-    if (!res.ok) throw new Error(`Failed to fetch tracks: ${res.status}: ${resText.substring(0,200)}`);
-    const data = JSON.parse(resText);
-    for (const item of data.items) {
-      const track = item.track;
-      if (!track || !track.id) continue;
-      const albumName = track.album?.name || '';
-      const year = parseInt((track.album?.release_date || '').substring(0, 4)) || 0;
-      tracks.push({
-        id: track.id,
-        title: cleanTitle(track.name),
-        artist: track.artists.map(a => a.name).join(' & '),
-        year,
-        yearWarning: isLikelyRemaster(albumName)
-          ? `Album "${albumName}" may be a remaster or compilation — year ${year} may not be the original release`
-          : null,
-      });
+// ── CSV parser ────────────────────────────────────────────────────────────────
+function parseCSVLine(line) {
+  const result = [];
+  let current = '';
+  let inQuotes = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (ch === '"') {
+      if (inQuotes && line[i+1] === '"') { current += '"'; i++; }
+      else inQuotes = !inQuotes;
+    } else if (ch === ',' && !inQuotes) {
+      result.push(current.trim());
+      current = '';
+    } else {
+      current += ch;
     }
-    url = data.next || null;
   }
-  return { name: meta.name, tracks };
+  result.push(current.trim());
+  return result;
 }
 
 // ── Routes ────────────────────────────────────────────────────────────────────
@@ -175,88 +114,106 @@ app.get('/', (req, res) => res.json({ status: 'ok', service: 'Hitstrr API' }));
 
 app.get('/playlists', (req, res) => res.json(loadPlaylists()));
 
-// Step 1: Client calls this to get the Spotify auth URL
-// Returns either { authUrl } (needs login) or adds directly if app token works
-app.post('/playlists/prepare', async (req, res) => {
+// Add playlist by Spotify URL
+app.post('/playlists', async (req, res) => {
   const { url, emoji } = req.body;
   if (!url) return res.status(400).json({ error: 'url is required' });
   const playlistId = extractPlaylistId(url);
   if (!playlistId) return res.status(400).json({ error: 'Invalid Spotify playlist URL' });
 
-  // Check duplicate
   const existing = loadPlaylists();
   if (existing.find(p => p.spotifyId === playlistId)) {
     return res.status(409).json({ error: 'This playlist is already in the game' });
   }
 
-  // Try app token first
   try {
     const token = await getAppToken();
-    const { name, tracks } = await fetchPlaylistWithToken(playlistId, token);
-    if (!tracks.length) return res.status(400).json({ error: 'Playlist has no playable tracks' });
-    const playlist = {
-      spotifyId: playlistId, name, emoji: emoji || '🎵',
-      tracks, flaggedCount: tracks.filter(t => t.yearWarning).length,
-      addedAt: new Date().toISOString(),
-    };
-    savePlaylists([...existing, playlist]);
-    return res.json({ success: true, playlist, method: 'app' });
-  } catch (e) {
-    // App token failed (probably 403) — need user auth
-    if (!e.message.includes('403')) {
-      return res.status(500).json({ error: e.message });
+    const metaRes = await fetch(`https://api.spotify.com/v1/playlists/${playlistId}?fields=name`, {
+      headers: { 'Authorization': `Bearer ${token}` }
+    });
+    if (!metaRes.ok) throw new Error(`Playlist not found or restricted (${metaRes.status}). Try CSV import instead.`);
+    const meta = await metaRes.json();
+
+    const tracks = [];
+    let trackUrl = `https://api.spotify.com/v1/playlists/${playlistId}/tracks?limit=100`;
+    while (trackUrl) {
+      const r = await fetch(trackUrl, { headers: { 'Authorization': `Bearer ${token}` } });
+      if (!r.ok) throw new Error(`Could not fetch tracks (${r.status}). This playlist may be restricted — try CSV import instead.`);
+      const data = await r.json();
+      for (const item of data.items) {
+        const track = item.track;
+        if (!track || !track.id) continue;
+        const albumName = track.album?.name || '';
+        const year = parseInt((track.album?.release_date || '').substring(0, 4)) || 0;
+        tracks.push({
+          id: track.id,
+          title: cleanTitle(track.name),
+          artist: track.artists.map(a => a.name).join(' & '),
+          year,
+          yearWarning: isLikelyRemaster(albumName)
+            ? `Album "${albumName}" may be a remaster or compilation — year ${year} may not be the original release`
+            : null,
+        });
+      }
+      trackUrl = data.next || null;
     }
+
+    if (!tracks.length) return res.status(400).json({ error: 'Playlist has no playable tracks' });
+    const playlist = { spotifyId: playlistId, name: meta.name, emoji: emoji || '🎵', tracks, flaggedCount: tracks.filter(t => t.yearWarning).length, addedAt: new Date().toISOString() };
+    savePlaylists([...existing, playlist]);
+    res.json({ success: true, playlist });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
   }
-
-  // Generate state token and store pending add
-  const state = Math.random().toString(36).substring(2) + Date.now().toString(36);
-  pendingAdds.set(state, { playlistId, emoji: emoji || '🎵', timestamp: Date.now() });
-
-  // Build Spotify auth URL — scope: playlist-read-private covers all public+private playlists
-  const params = new URLSearchParams({
-    client_id: SPOTIFY_CLIENT_ID,
-    response_type: 'code',
-    redirect_uri: REDIRECT_URI,
-    scope: 'playlist-read-private playlist-read-collaborative user-read-private',
-    state,
-    show_dialog: 'false', // don't show dialog if already authorized
-  });
-  const authUrl = `https://accounts.spotify.com/authorize?${params}`;
-  res.json({ needsAuth: true, authUrl });
 });
 
-// Step 2: Spotify redirects here after user login
-app.get('/callback', async (req, res) => {
-  const { code, state, error } = req.query;
-
-  if (error) {
-    return res.redirect(`${GAME_URL}?addError=${encodeURIComponent('Spotify login cancelled')}`);
-  }
-
-  const pending = pendingAdds.get(state);
-  if (!pending) {
-    return res.redirect(`${GAME_URL}?addError=${encodeURIComponent('Session expired — please try again')}`);
-  }
-  pendingAdds.delete(state);
+// Import playlist from Exportify CSV
+app.post('/playlists/import-csv', (req, res) => {
+  const { csv, name, emoji } = req.body;
+  if (!csv) return res.status(400).json({ error: 'csv is required' });
+  if (!name) return res.status(400).json({ error: 'name is required' });
 
   try {
-    const userToken = await getUserToken(code);
-    const { name, tracks } = await fetchPlaylistWithToken(pending.playlistId, userToken);
-    if (!tracks.length) {
-      return res.redirect(`${GAME_URL}?addError=${encodeURIComponent('Playlist has no playable tracks')}`);
+    const lines = csv.trim().split('\n');
+    if (lines.length < 2) return res.status(400).json({ error: 'CSV appears empty' });
+
+    const header = parseCSVLine(lines[0]);
+    const col = (name) => header.findIndex(h => h.toLowerCase().includes(name.toLowerCase()));
+    const uriIdx = col('track uri');
+    const titleIdx = col('track name');
+    const artistIdx = col('artist name');
+    const dateIdx = col('release date');
+
+    if (uriIdx === -1 || titleIdx === -1) {
+      return res.status(400).json({ error: 'CSV missing required columns. Please export from exportify.net' });
     }
-    const playlist = {
-      spotifyId: pending.playlistId, name, emoji: pending.emoji,
-      tracks, flaggedCount: tracks.filter(t => t.yearWarning).length,
-      addedAt: new Date().toISOString(),
-    };
+
+    const tracks = [];
+    const seen = new Set();
+    for (let i = 1; i < lines.length; i++) {
+      const cols = parseCSVLine(lines[i]);
+      if (cols.length < 2) continue;
+      const uri = cols[uriIdx] || '';
+      const id = uri.replace('spotify:track:', '').trim();
+      if (!id || seen.has(id)) continue;
+      seen.add(id);
+      const title = cols[titleIdx] || '';
+      const artist = (cols[artistIdx] || '').replace(/;/g, ' & ');
+      const rawDate = dateIdx !== -1 ? (cols[dateIdx] || '') : '';
+      const year = parseInt(rawDate.substring(0, 4)) || 0;
+      if (!title) continue;
+      tracks.push({ id, title: cleanTitle(title), artist, year, yearWarning: null });
+    }
+
+    if (!tracks.length) return res.status(400).json({ error: 'No valid tracks found in CSV' });
+
+    const spotifyId = 'csv_' + name.toLowerCase().replace(/[^a-z0-9]/g, '_').substring(0, 30) + '_' + Date.now();
     const existing = loadPlaylists();
-    if (!existing.find(p => p.spotifyId === pending.playlistId)) {
-      savePlaylists([...existing, playlist]);
-    }
-    res.redirect(`${GAME_URL}?addSuccess=${encodeURIComponent(name)}`);
+    const playlist = { spotifyId, name, emoji: emoji || '🎵', tracks, flaggedCount: 0, addedAt: new Date().toISOString() };
+    savePlaylists([...existing, playlist]);
+    res.json({ success: true, playlist });
   } catch (e) {
-    res.redirect(`${GAME_URL}?addError=${encodeURIComponent(e.message)}`);
+    res.status(500).json({ error: e.message });
   }
 });
 
@@ -283,80 +240,6 @@ app.patch('/playlists/:id/tracks/:trackId', (req, res) => {
   res.json(playlists[plIdx].tracks[tIdx]);
 });
 
-// Import playlist from CSV (Exportify format)
-app.post('/playlists/import-csv', (req, res) => {
-  const { csv, name, emoji } = req.body;
-  if (!csv) return res.status(400).json({ error: 'csv is required' });
-  if (!name) return res.status(400).json({ error: 'name is required' });
-
-  try {
-    const lines = csv.trim().split('\n');
-    if (lines.length < 2) return res.status(400).json({ error: 'CSV appears empty' });
-
-    // Parse header to find column indices
-    const header = parseCSVLine(lines[0]);
-    const col = (name) => header.findIndex(h => h.toLowerCase().includes(name.toLowerCase()));
-    const uriIdx = col('track uri');
-    const titleIdx = col('track name');
-    const artistIdx = col('artist name');
-    const dateIdx = col('release date');
-
-    if (uriIdx === -1 || titleIdx === -1) {
-      return res.status(400).json({ error: 'CSV missing required columns (Track URI, Track Name). Please export from exportify.net' });
-    }
-
-    const tracks = [];
-    const seen = new Set();
-    for (let i = 1; i < lines.length; i++) {
-      const cols = parseCSVLine(lines[i]);
-      if (cols.length < 2) continue;
-      const uri = cols[uriIdx] || '';
-      const id = uri.replace('spotify:track:', '').trim();
-      if (!id || seen.has(id)) continue;
-      seen.add(id);
-      const title = cols[titleIdx] || '';
-      const artist = (cols[artistIdx] || '').replace(/;/g, ' & ');
-      const rawDate = cols[dateIdx] || '';
-      const year = parseInt(rawDate.substring(0, 4)) || 0;
-      if (!title) continue;
-      tracks.push({ id, title: cleanTitle(title), artist, year,
-        yearWarning: isLikelyRemaster(title + ' ' + (cols[dateIdx+1] || '')) ? 'Year may be from a remaster or compilation' : null
-      });
-    }
-
-    if (!tracks.length) return res.status(400).json({ error: 'No valid tracks found in CSV' });
-
-    // Generate a spotifyId from the name for dedup purposes
-    const spotifyId = 'csv_' + name.toLowerCase().replace(/[^a-z0-9]/g, '_').substring(0, 30) + '_' + Date.now();
-    const existing = loadPlaylists();
-    const playlist = { spotifyId, name, emoji: emoji || '🎵', tracks, flaggedCount: tracks.filter(t => t.yearWarning).length, addedAt: new Date().toISOString() };
-    savePlaylists([...existing, playlist]);
-    res.json({ success: true, playlist });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-function parseCSVLine(line) {
-  const result = [];
-  let current = '';
-  let inQuotes = false;
-  for (let i = 0; i < line.length; i++) {
-    const ch = line[i];
-    if (ch === '"') {
-      if (inQuotes && line[i+1] === '"') { current += '"'; i++; }
-      else inQuotes = !inQuotes;
-    } else if (ch === ',' && !inQuotes) {
-      result.push(current.trim());
-      current = '';
-    } else {
-      current += ch;
-    }
-  }
-  result.push(current.trim());
-  return result;
-}
-
 // Update emoji
 app.patch('/playlists/:id', (req, res) => {
   const { emoji } = req.body;
@@ -368,7 +251,7 @@ app.patch('/playlists/:id', (req, res) => {
   res.json(playlists[idx]);
 });
 
-// Delete
+// Delete playlist
 app.delete('/playlists/:id', (req, res) => {
   const playlists = loadPlaylists();
   const filtered = playlists.filter(p => p.spotifyId !== req.params.id);
@@ -376,17 +259,5 @@ app.delete('/playlists/:id', (req, res) => {
   savePlaylists(filtered);
   res.json({ success: true });
 });
-
-// ── Keep-alive: ping self every 10 minutes to prevent Railway sleeping ───────
-const SELF_URL = process.env.RAILWAY_PUBLIC_DOMAIN
-  ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}/`
-  : null;
-
-if (SELF_URL) {
-  setInterval(async () => {
-    try { await fetch(SELF_URL); }
-    catch (e) { /* ignore */ }
-  }, 10 * 60 * 1000); // every 10 minutes
-}
 
 app.listen(PORT, '0.0.0.0', () => console.log(`Hitstrr server running on port ${PORT}`));
