@@ -141,7 +141,7 @@ async function fetchPlaylistWithToken(playlistId, token) {
   const meta = JSON.parse(metaText);
 
   const tracks = [];
-  let url = `https://api.spotify.com/v1/playlists/${playlistId}/tracks?limit=100`;
+  let url = `https://api.spotify.com/v1/playlists/${playlistId}/tracks?limit=100&market=SE&additional_types=track`;
   while (url) {
     console.log('Fetching tracks page:', url.substring(0,80));
     const res = await fetch(url, { headers: { 'Authorization': `Bearer ${token}` } });
