@@ -283,6 +283,80 @@ app.patch('/playlists/:id/tracks/:trackId', (req, res) => {
   res.json(playlists[plIdx].tracks[tIdx]);
 });
 
+// Import playlist from CSV (Exportify format)
+app.post('/playlists/import-csv', (req, res) => {
+  const { csv, name, emoji } = req.body;
+  if (!csv) return res.status(400).json({ error: 'csv is required' });
+  if (!name) return res.status(400).json({ error: 'name is required' });
+
+  try {
+    const lines = csv.trim().split('\n');
+    if (lines.length < 2) return res.status(400).json({ error: 'CSV appears empty' });
+
+    // Parse header to find column indices
+    const header = parseCSVLine(lines[0]);
+    const col = (name) => header.findIndex(h => h.toLowerCase().includes(name.toLowerCase()));
+    const uriIdx = col('track uri');
+    const titleIdx = col('track name');
+    const artistIdx = col('artist name');
+    const dateIdx = col('release date');
+
+    if (uriIdx === -1 || titleIdx === -1) {
+      return res.status(400).json({ error: 'CSV missing required columns (Track URI, Track Name). Please export from exportify.net' });
+    }
+
+    const tracks = [];
+    const seen = new Set();
+    for (let i = 1; i < lines.length; i++) {
+      const cols = parseCSVLine(lines[i]);
+      if (cols.length < 2) continue;
+      const uri = cols[uriIdx] || '';
+      const id = uri.replace('spotify:track:', '').trim();
+      if (!id || seen.has(id)) continue;
+      seen.add(id);
+      const title = cols[titleIdx] || '';
+      const artist = (cols[artistIdx] || '').replace(/;/g, ' & ');
+      const rawDate = cols[dateIdx] || '';
+      const year = parseInt(rawDate.substring(0, 4)) || 0;
+      if (!title) continue;
+      tracks.push({ id, title: cleanTitle(title), artist, year,
+        yearWarning: isLikelyRemaster(title + ' ' + (cols[dateIdx+1] || '')) ? 'Year may be from a remaster or compilation' : null
+      });
+    }
+
+    if (!tracks.length) return res.status(400).json({ error: 'No valid tracks found in CSV' });
+
+    // Generate a spotifyId from the name for dedup purposes
+    const spotifyId = 'csv_' + name.toLowerCase().replace(/[^a-z0-9]/g, '_').substring(0, 30) + '_' + Date.now();
+    const existing = loadPlaylists();
+    const playlist = { spotifyId, name, emoji: emoji || '🎵', tracks, flaggedCount: tracks.filter(t => t.yearWarning).length, addedAt: new Date().toISOString() };
+    savePlaylists([...existing, playlist]);
+    res.json({ success: true, playlist });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+function parseCSVLine(line) {
+  const result = [];
+  let current = '';
+  let inQuotes = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (ch === '"') {
+      if (inQuotes && line[i+1] === '"') { current += '"'; i++; }
+      else inQuotes = !inQuotes;
+    } else if (ch === ',' && !inQuotes) {
+      result.push(current.trim());
+      current = '';
+    } else {
+      current += ch;
+    }
+  }
+  result.push(current.trim());
+  return result;
+}
+
 // Update emoji
 app.patch('/playlists/:id', (req, res) => {
   const { emoji } = req.body;
