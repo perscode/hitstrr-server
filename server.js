@@ -7,75 +7,92 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const DATA_FILE = path.join(__dirname, 'playlists.json');
 
-// ── Spotify credentials from environment variables ───────────────────────────
 const SPOTIFY_CLIENT_ID = process.env.SPOTIFY_CLIENT_ID;
 const SPOTIFY_CLIENT_SECRET = process.env.SPOTIFY_CLIENT_SECRET;
+const REDIRECT_URI = process.env.REDIRECT_URI || 'https://hitstrr-server-production.up.railway.app/callback';
+// Where to send the user after auth — the game's URL
+const GAME_URL = process.env.GAME_URL || 'https://flanders-pixel.github.io/hitstrr/';
 
 if (!SPOTIFY_CLIENT_ID || !SPOTIFY_CLIENT_SECRET) {
-  console.warn('WARNING: SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET not set. Playlist fetching will not work until these are added in Railway Variables.');
+  console.warn('WARNING: SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET not set.');
 }
 
-// ── Middleware ────────────────────────────────────────────────────────────────
 app.use(cors());
 app.use(express.json());
 
-// ── Persistent storage ────────────────────────────────────────────────────────
+// ── Storage ───────────────────────────────────────────────────────────────────
 function loadPlaylists() {
   if (!fs.existsSync(DATA_FILE)) return [];
   try { return JSON.parse(fs.readFileSync(DATA_FILE, 'utf8')); }
   catch (e) { return []; }
 }
-
 function savePlaylists(playlists) {
   fs.writeFileSync(DATA_FILE, JSON.stringify(playlists, null, 2));
 }
 
-// ── Spotify API helpers ───────────────────────────────────────────────────────
-let spotifyToken = null;
-let tokenExpiry = 0;
+// ── Pending playlist adds (in-memory, keyed by state param) ──────────────────
+// state -> { playlistUrl, emoji, timestamp }
+const pendingAdds = new Map();
 
-async function getSpotifyToken() {
-  if (spotifyToken && Date.now() < tokenExpiry) return spotifyToken;
+// Clean up old pending adds every 10 minutes
+setInterval(() => {
+  const cutoff = Date.now() - 10 * 60 * 1000;
+  for (const [k, v] of pendingAdds) {
+    if (v.timestamp < cutoff) pendingAdds.delete(k);
+  }
+}, 10 * 60 * 1000);
+
+// ── App-level Spotify token (for non-restricted playlists) ────────────────────
+let appToken = null;
+let appTokenExpiry = 0;
+
+async function getAppToken() {
+  if (appToken && Date.now() < appTokenExpiry) return appToken;
   const creds = Buffer.from(`${SPOTIFY_CLIENT_ID}:${SPOTIFY_CLIENT_SECRET}`).toString('base64');
   const res = await fetch('https://accounts.spotify.com/api/token', {
     method: 'POST',
-    headers: {
-      'Authorization': `Basic ${creds}`,
-      'Content-Type': 'application/x-www-form-urlencoded',
-    },
+    headers: { 'Authorization': `Basic ${creds}`, 'Content-Type': 'application/x-www-form-urlencoded' },
     body: 'grant_type=client_credentials',
   });
   if (!res.ok) throw new Error(`Spotify auth failed: ${res.status}`);
   const data = await res.json();
-  spotifyToken = data.access_token;
-  tokenExpiry = Date.now() + (data.expires_in - 60) * 1000;
-  return spotifyToken;
+  appToken = data.access_token;
+  appTokenExpiry = Date.now() + (data.expires_in - 60) * 1000;
+  return appToken;
 }
 
-function extractPlaylistId(input) {
-  // Handle full URLs like https://open.spotify.com/playlist/6V406vY7zZ8NeaqL9XS0U0?si=...
-  const urlMatch = input.match(/playlist\/([a-zA-Z0-9]+)/);
-  if (urlMatch) return urlMatch[1];
-  // Handle plain IDs
-  if (/^[a-zA-Z0-9]+$/.test(input.trim())) return input.trim();
-  return null;
+// ── User OAuth token exchange ─────────────────────────────────────────────────
+async function getUserToken(code) {
+  const creds = Buffer.from(`${SPOTIFY_CLIENT_ID}:${SPOTIFY_CLIENT_SECRET}`).toString('base64');
+  const res = await fetch('https://accounts.spotify.com/api/token', {
+    method: 'POST',
+    headers: { 'Authorization': `Basic ${creds}`, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      grant_type: 'authorization_code',
+      code,
+      redirect_uri: REDIRECT_URI,
+    }).toString(),
+  });
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`Token exchange failed: ${res.status} ${err}`);
+  }
+  const data = await res.json();
+  return data.access_token; // We only need this once, don't store it
 }
 
-// ── Year quality detection ───────────────────────────────────────────────────
+// ── Year detection ────────────────────────────────────────────────────────────
 const REMASTER_KEYWORDS = [
   'remaster','remastered','reissue','reissued','re-issue',
   'greatest hits','greatest hit','best of','best-of',
   'collection','anthology','the singles','hits',
   'anniversary','deluxe','deluxe edition','expanded',
-  'bonus','bonus track','legacy edition',
-  'platinum edition','gold edition','special edition',
-  'complete recordings','essential','ultimate',
+  'bonus','legacy edition','platinum edition','gold edition',
+  'special edition','complete recordings','essential','ultimate',
   'definitive collection','the very best',
-  'live','live at','live in','live from',
-  'unplugged','acoustic',
+  'live','live at','live in','live from','unplugged','acoustic',
   'box set','boxset',
 ];
-
 const TITLE_SUFFIXES = [
   /\s*[-\u2013\u2014]\s*\d{4}\s+remaster(ed)?$/i,
   /\s*[-\u2013\u2014]\s*remaster(ed)?(\s+\d{4})?$/i,
@@ -83,122 +100,159 @@ const TITLE_SUFFIXES = [
   /\s*\[.*remaster.*\]$/i,
   /\s*[-\u2013\u2014]\s*single (version|edit)$/i,
   /\s*\(single (version|edit)\)$/i,
-  /\s*[-\u2013\u2014]\s*\d{4} digital remaster$/i,
 ];
-
 function isLikelyRemaster(albumName) {
   if (!albumName) return false;
   const lower = albumName.toLowerCase();
   return REMASTER_KEYWORDS.some(kw => lower.includes(kw));
 }
-
 function cleanTitle(title) {
   let t = title;
   for (const re of TITLE_SUFFIXES) t = t.replace(re, '');
   return t.trim();
 }
 
-async function fetchPlaylistFromSpotify(playlistId) {
-  const token = await getSpotifyToken();
+function extractPlaylistId(input) {
+  const urlMatch = input.match(/playlist\/([a-zA-Z0-9]+)/);
+  if (urlMatch) return urlMatch[1];
+  if (/^[a-zA-Z0-9]+$/.test(input.trim())) return input.trim();
+  return null;
+}
 
-  const metaRes = await fetch(`https://api.spotify.com/v1/playlists/${playlistId}?fields=name,description,images`, {
-    headers: { 'Authorization': `Bearer ${token}` }
-  });
-  if (!metaRes.ok) throw new Error(`Playlist not found or not public (${metaRes.status})`);
+// ── Fetch playlist tracks with a given token ──────────────────────────────────
+async function fetchPlaylistWithToken(playlistId, token) {
+  const metaRes = await fetch(
+    `https://api.spotify.com/v1/playlists/${playlistId}?fields=name,description`,
+    { headers: { 'Authorization': `Bearer ${token}` } }
+  );
+  if (!metaRes.ok) throw new Error(`Playlist not found or not accessible (${metaRes.status})`);
   const meta = await metaRes.json();
 
   const tracks = [];
-  let url = `https://api.spotify.com/v1/playlists/${playlistId}/tracks?limit=100&fields=next,items(track(id,name,artists,album(name,release_date,album_type)))`;
-
+  let url = `https://api.spotify.com/v1/playlists/${playlistId}/tracks?limit=100&fields=next,items(track(id,name,artists,album(name,release_date)))`;
   while (url) {
     const res = await fetch(url, { headers: { 'Authorization': `Bearer ${token}` } });
     if (!res.ok) throw new Error(`Failed to fetch tracks: ${res.status}`);
     const data = await res.json();
-
     for (const item of data.items) {
       const track = item.track;
       if (!track || !track.id) continue;
-
       const albumName = track.album?.name || '';
-      const rawDate = track.album?.release_date || '';
-      const year = parseInt(rawDate.substring(0, 4)) || 0;
-      const suspicious = isLikelyRemaster(albumName);
-      const cleanedTitle = cleanTitle(track.name);
-
+      const year = parseInt((track.album?.release_date || '').substring(0, 4)) || 0;
       tracks.push({
         id: track.id,
-        title: cleanedTitle,
+        title: cleanTitle(track.name),
         artist: track.artists.map(a => a.name).join(' & '),
         year,
-        yearWarning: suspicious ? `Album "${albumName}" may be a remaster or compilation — year ${year} may not be the original release` : null,
+        yearWarning: isLikelyRemaster(albumName)
+          ? `Album "${albumName}" may be a remaster or compilation — year ${year} may not be the original release`
+          : null,
       });
     }
     url = data.next || null;
   }
-
-  const flaggedCount = tracks.filter(t => t.yearWarning).length;
-
-  return {
-    spotifyId: playlistId,
-    name: meta.name,
-    emoji: '\uD83C\uDFB5',
-    tracks,
-    flaggedCount,
-    addedAt: new Date().toISOString(),
-  };
+  return { name: meta.name, tracks };
 }
 
 // ── Routes ────────────────────────────────────────────────────────────────────
 
-// Health check
-app.get('/', (req, res) => {
-  res.json({ status: 'ok', service: 'Hitstrr API' });
-});
+app.get('/', (req, res) => res.json({ status: 'ok', service: 'Hitstrr API' }));
 
-// Get all playlists
-app.get('/playlists', (req, res) => {
-  const playlists = loadPlaylists();
-  res.json(playlists);
-});
+app.get('/playlists', (req, res) => res.json(loadPlaylists()));
 
-// Add a playlist by Spotify URL or ID
-app.post('/playlists', async (req, res) => {
+// Step 1: Client calls this to get the Spotify auth URL
+// Returns either { authUrl } (needs login) or adds directly if app token works
+app.post('/playlists/prepare', async (req, res) => {
   const { url, emoji } = req.body;
   if (!url) return res.status(400).json({ error: 'url is required' });
-
   const playlistId = extractPlaylistId(url);
-  if (!playlistId) return res.status(400).json({ error: 'Invalid Spotify playlist URL or ID' });
+  if (!playlistId) return res.status(400).json({ error: 'Invalid Spotify playlist URL' });
 
-  // Check for duplicate
+  // Check duplicate
   const existing = loadPlaylists();
   if (existing.find(p => p.spotifyId === playlistId)) {
     return res.status(409).json({ error: 'This playlist is already in the game' });
   }
 
+  // Try app token first
   try {
-    const playlist = await fetchPlaylistFromSpotify(playlistId);
-    if (emoji) playlist.emoji = emoji;
-    if (playlist.tracks.length === 0) {
-      return res.status(400).json({ error: 'Playlist has no playable tracks' });
+    const token = await getAppToken();
+    const { name, tracks } = await fetchPlaylistWithToken(playlistId, token);
+    if (!tracks.length) return res.status(400).json({ error: 'Playlist has no playable tracks' });
+    const playlist = {
+      spotifyId: playlistId, name, emoji: emoji || '🎵',
+      tracks, flaggedCount: tracks.filter(t => t.yearWarning).length,
+      addedAt: new Date().toISOString(),
+    };
+    savePlaylists([...existing, playlist]);
+    return res.json({ success: true, playlist, method: 'app' });
+  } catch (e) {
+    // App token failed (probably 403) — need user auth
+    if (!e.message.includes('403')) {
+      return res.status(500).json({ error: e.message });
     }
-    const playlists = [...existing, playlist];
-    savePlaylists(playlists);
-    res.json({ success: true, playlist });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
+  }
+
+  // Generate state token and store pending add
+  const state = Math.random().toString(36).substring(2) + Date.now().toString(36);
+  pendingAdds.set(state, { playlistId, emoji: emoji || '🎵', timestamp: Date.now() });
+
+  // Build Spotify auth URL — scope: playlist-read-private covers all public+private playlists
+  const params = new URLSearchParams({
+    client_id: SPOTIFY_CLIENT_ID,
+    response_type: 'code',
+    redirect_uri: REDIRECT_URI,
+    scope: 'playlist-read-private playlist-read-collaborative',
+    state,
+    show_dialog: 'false', // don't show dialog if already authorized
+  });
+  const authUrl = `https://accounts.spotify.com/authorize?${params}`;
+  res.json({ needsAuth: true, authUrl });
+});
+
+// Step 2: Spotify redirects here after user login
+app.get('/callback', async (req, res) => {
+  const { code, state, error } = req.query;
+
+  if (error) {
+    return res.redirect(`${GAME_URL}?addError=${encodeURIComponent('Spotify login cancelled')}`);
+  }
+
+  const pending = pendingAdds.get(state);
+  if (!pending) {
+    return res.redirect(`${GAME_URL}?addError=${encodeURIComponent('Session expired — please try again')}`);
+  }
+  pendingAdds.delete(state);
+
+  try {
+    const userToken = await getUserToken(code);
+    const { name, tracks } = await fetchPlaylistWithToken(pending.playlistId, userToken);
+    if (!tracks.length) {
+      return res.redirect(`${GAME_URL}?addError=${encodeURIComponent('Playlist has no playable tracks')}`);
+    }
+    const playlist = {
+      spotifyId: pending.playlistId, name, emoji: pending.emoji,
+      tracks, flaggedCount: tracks.filter(t => t.yearWarning).length,
+      addedAt: new Date().toISOString(),
+    };
+    const existing = loadPlaylists();
+    if (!existing.find(p => p.spotifyId === pending.playlistId)) {
+      savePlaylists([...existing, playlist]);
+    }
+    res.redirect(`${GAME_URL}?addSuccess=${encodeURIComponent(name)}`);
+  } catch (e) {
+    res.redirect(`${GAME_URL}?addError=${encodeURIComponent(e.message)}`);
   }
 });
 
-// Get flagged tracks for a playlist (potential bad years)
+// Get flagged tracks
 app.get('/playlists/:id/flags', (req, res) => {
-  const playlists = loadPlaylists();
-  const pl = playlists.find(p => p.spotifyId === req.params.id);
-  if (!pl) return res.status(404).json({ error: 'Playlist not found' });
-  const flagged = pl.tracks.filter(t => t.yearWarning);
-  res.json({ playlist: pl.name, flaggedCount: flagged.length, tracks: flagged });
+  const pl = loadPlaylists().find(p => p.spotifyId === req.params.id);
+  if (!pl) return res.status(404).json({ error: 'Not found' });
+  res.json({ playlist: pl.name, flaggedCount: pl.tracks.filter(t => t.yearWarning).length, tracks: pl.tracks.filter(t => t.yearWarning) });
 });
 
-// Manually correct a track year
+// Correct a track year
 app.patch('/playlists/:id/tracks/:trackId', (req, res) => {
   const { year } = req.body;
   if (!year || isNaN(year)) return res.status(400).json({ error: 'Valid year required' });
@@ -208,33 +262,30 @@ app.patch('/playlists/:id/tracks/:trackId', (req, res) => {
   const tIdx = playlists[plIdx].tracks.findIndex(t => t.id === req.params.trackId);
   if (tIdx === -1) return res.status(404).json({ error: 'Track not found' });
   playlists[plIdx].tracks[tIdx].year = parseInt(year);
-  playlists[plIdx].tracks[tIdx].yearWarning = null; // clear the warning
+  playlists[plIdx].tracks[tIdx].yearWarning = null;
   playlists[plIdx].tracks[tIdx].yearCorrected = true;
   savePlaylists(playlists);
   res.json(playlists[plIdx].tracks[tIdx]);
 });
 
-// Update playlist emoji
+// Update emoji
 app.patch('/playlists/:id', (req, res) => {
   const { emoji } = req.body;
   const playlists = loadPlaylists();
   const idx = playlists.findIndex(p => p.spotifyId === req.params.id);
-  if (idx === -1) return res.status(404).json({ error: 'Playlist not found' });
+  if (idx === -1) return res.status(404).json({ error: 'Not found' });
   if (emoji) playlists[idx].emoji = emoji;
   savePlaylists(playlists);
   res.json(playlists[idx]);
 });
 
-// Delete a playlist
+// Delete
 app.delete('/playlists/:id', (req, res) => {
   const playlists = loadPlaylists();
   const filtered = playlists.filter(p => p.spotifyId !== req.params.id);
-  if (filtered.length === playlists.length) return res.status(404).json({ error: 'Playlist not found' });
+  if (filtered.length === playlists.length) return res.status(404).json({ error: 'Not found' });
   savePlaylists(filtered);
   res.json({ success: true });
 });
 
-// ── Start ─────────────────────────────────────────────────────────────────────
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Hitstrr server running on port ${PORT}`);
-});
+app.listen(PORT, '0.0.0.0', () => console.log(`Hitstrr server running on port ${PORT}`));
