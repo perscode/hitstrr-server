@@ -18,7 +18,12 @@ if (!SPOTIFY_CLIENT_ID || !SPOTIFY_CLIENT_SECRET) {
   console.warn('WARNING: SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET not set.');
 }
 
-app.use(cors());
+app.use(cors({
+  origin: ['https://flanders-pixel.github.io', 'http://localhost:3000', 'http://localhost:8080'],
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+}));
+app.options('*', cors()); // handle preflight
 app.use(express.json());
 
 // ── Storage ───────────────────────────────────────────────────────────────────
@@ -288,5 +293,17 @@ app.delete('/playlists/:id', (req, res) => {
   savePlaylists(filtered);
   res.json({ success: true });
 });
+
+// ── Keep-alive: ping self every 10 minutes to prevent Railway sleeping ───────
+const SELF_URL = process.env.RAILWAY_PUBLIC_DOMAIN
+  ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}/`
+  : null;
+
+if (SELF_URL) {
+  setInterval(async () => {
+    try { await fetch(SELF_URL); }
+    catch (e) { /* ignore */ }
+  }, 10 * 60 * 1000); // every 10 minutes
+}
 
 app.listen(PORT, '0.0.0.0', () => console.log(`Hitstrr server running on port ${PORT}`));
