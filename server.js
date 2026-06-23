@@ -15,7 +15,7 @@ if (!SPOTIFY_CLIENT_ID || !SPOTIFY_CLIENT_SECRET) {
 }
 
 app.use(cors({
-  origin: ['https://flanders-pixel.github.io', 'http://localhost:3000', 'http://localhost:8080'],
+  origin: ['https://flanders-pixel.github.io', 'http://localhost:3000', 'http://localhost:8080', 'http://127.0.0.1:8080'],
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
 }));
@@ -110,7 +110,9 @@ function parseCSVLine(line) {
 
 // ── Routes ────────────────────────────────────────────────────────────────────
 
-app.get('/', (req, res) => res.json({ status: 'ok', service: 'Hitstrr API' }));
+// Serve the frontend (index.html lives alongside server.js)
+app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'index.html')));
+app.get('/health', (req, res) => res.json({ status: 'ok', service: 'Hitstrr API' }));
 
 app.get('/playlists', (req, res) => res.json(loadPlaylists()));
 
